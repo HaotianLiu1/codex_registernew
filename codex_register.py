@@ -1,7 +1,7 @@
 """
 codex 账号协议注册
 直接调用 OpenAI 认证接口完成注册流程，无需浏览器。
-通过 MailAPI 获取验证码。
+通过 mail.tm 临时邮箱自动获取验证码，无需配置 MailAPI。
 
 用法:
     python codex_register.py                         # 默认配置
@@ -28,7 +28,7 @@ from typing import Optional, Callable
 import argparse
 
 from curl_cffi import requests as cffi_requests
-from mailapi import MailAPI
+import mailtm
 
 # ═══════════════════════════════════════════════════════
 # 常量配置
@@ -58,15 +58,15 @@ PROXY_CACHE_FILE = os.path.join(SCRIPT_DIR, "proxy_cache.json")
 
 
 
-# 邮箱后缀
-EMAIL_DOMAINS = ["example1.com", "example2.com", "example3.com", "example4.com"]
+# 邮箱后缀（已废弃：现在使用 mail.tm 自动生成临时邮箱，无需配置域名）
+EMAIL_DOMAINS: list[str] = []
 # Token 上传服务器
 CPA_URL = ""#http://your-server:port
 MANAGEMENT_KEY = "your-management-key"
-# MailAPI 配置（固定）
-MAIL_API_URL = "https://mail.example.com"
-MAIL_API_AUTH = "your-mailapi-auth"
-MAIL_PASSWD = ""  # 可选，cloudflare_temp_email私有站点密码
+# MailAPI 配置（已废弃：现在使用 mail.tm，以下配置不再生效）
+MAIL_API_URL = ""
+MAIL_API_AUTH = ""
+MAIL_PASSWD = ""  # 已废弃
 # 超时与重试
 MAIL_POLL_TIMEOUT = 180
 OTP_RESEND_INTERVAL = 25
@@ -101,6 +101,7 @@ log = _setup_logger()
 class MailAccount:
     """邮箱账号"""
     email: str
+    fetch_code: Optional[Callable[[], Optional[str]]] = None
 
 
 def random_email() -> str:
@@ -237,25 +238,23 @@ def decode_jwt_payload(token: str) -> dict:
 
 
 # ═══════════════════════════════════════════════════════
-# MailAPI 验证码获取
+# 验证码获取（mail.tm）
 # ═══════════════════════════════════════════════════════
 
 
 def poll_verification_code(
     account: MailAccount,
-    mail_api: MailAPI,
     timeout: int = MAIL_POLL_TIMEOUT,
     used_codes: Optional[set] = None,
     resend_fn: Optional[Callable] = None,
-    otp_sent_at: Optional[float] = None,
+    otp_sent_at: Optional[float] = None,  # 保留参数：可用于将来按时间戳过滤邮件
     cancel_fn: Optional[Callable] = None,
 ) -> str:
-    """通过 MailAPI 轮询获取 OpenAI 6 位验证码
+    """通过 mail.tm 轮询获取 OpenAI 6 位验证码
 
-    mail_api: MailAPI 实例
-    otp_sent_at: OTP 发送时的 Unix 时间戳，只接受此时间之后的邮件
+    otp_sent_at: OTP 发送时的 Unix 时间戳（当前保留参数，以备将来使用）
     """
-    log.info(f"    📧 等待验证码 ({account.email}, MailAPI)...")
+    log.info(f"    📧 等待验证码 ({account.email}, mail.tm)...")
     used = used_codes or set()
     start = time.time()
     intervals = [3, 4, 5, 6, 8, 10]
@@ -277,7 +276,7 @@ def poll_verification_code(
             raise InterruptedError("用户取消")
 
         try:
-            code = mail_api.get_latest_code(address=account.email)
+            code = account.fetch_code() if account.fetch_code else None
             if code and code not in used:
                 used.add(code)
                 elapsed = int(time.time() - start)
@@ -286,7 +285,7 @@ def poll_verification_code(
         except InterruptedError:
             raise
         except Exception as e:
-            log.warning(f"    MailAPI 查询失败: {e}")
+            log.warning(f"    mail.tm 查询失败: {e}")
 
         # 定时重发 OTP
         elapsed_now = time.time() - start
@@ -468,7 +467,6 @@ def generate_password():
 # ═══════════════════════════════════════════════════════
 def register_account(
     mail_account: MailAccount,
-    mail_api: MailAPI,
     proxy: str = "",
     used_codes: Optional[set] = None,
     password: Optional[str] = None,
@@ -588,14 +586,14 @@ def register_account(
                 raise RuntimeError(f"发送 OTP 失败: {otp_resp.status} {otp_resp.text[:300]}")
             log.info(f"      OK，验证码已发送到 {email_addr}")
 
-        # --- 5. 通过 MailAPI 获取验证码 ---
+        # --- 5. 通过 mail.tm 获取验证码 ---
         def _resend():
             r = http.post_json(OAI_RESEND_OTP_URL, {},
                 headers={"Referer": "https://auth.openai.com/email-verification"})
             return r.ok()
 
         code = poll_verification_code(
-            mail_account, mail_api,
+            mail_account,
             used_codes=codes,
             resend_fn=_resend,
             otp_sent_at=otp_sent_at,
@@ -724,8 +722,6 @@ def register_account(
 # 单账号注册（带重试）
 # ═══════════════════════════════════════════════════════
 def _do_one(
-    account: MailAccount,
-    mail_api: MailAPI,
     idx: int,
     total: int,
     proxy_pool: list[str],
@@ -737,12 +733,11 @@ def _do_one(
     if delay > 0:
         time.sleep(delay)
 
-
     start_t = time.time()
-
     used = set()
+
     log.info(f"\n{'─'*50}")
-    log.info(f"[{idx}/{total}] {account.email}")
+    log.info(f"[{idx}/{total}] 开始创建账号...")
     log.info(f"{'─'*50}")
 
     ok = False
@@ -752,9 +747,21 @@ def _do_one(
             log.info(f"  重试 #{attempt}...")
             time.sleep(random.uniform(2, 5))
         log.info(f"  🌐 代理: {proxy or '无'}")
+
+        # 将代理字符串转为 requests 所需的 dict 格式
+        proxy_dict = {"http": proxy, "https": proxy} if proxy else None
+
         try:
+            # 为本次尝试创建 mail.tm 临时邮箱
+            mailtm_acct = mailtm.setup_mail_tm(proxies=proxy_dict)
+            account = MailAccount(
+                email=mailtm_acct.email,
+                fetch_code=mailtm_acct.fetch_code,
+            )
+            log.info(f"  📧 邮箱: {account.email}")
+
             password = generate_password()
-            result = register_account(account, mail_api, proxy, used,password)
+            result = register_account(account, proxy, used, password)
             elapsed = round(time.time() - start_t, 1)
             result["elapsed_seconds"] = elapsed
 
@@ -834,10 +841,7 @@ def main():
     log.info("=" * 55)
     log.info(" codex 注册机")
     log.info("=" * 55)
-
-    mail_api = MailAPI(worker_url=MAIL_API_URL, admin_auth=MAIL_API_AUTH)
-    log.info(f"📨 MailAPI: {MAIL_API_URL}")
-
+    log.info("📨 已切换为 mail.tm 自动临时邮箱，无需配置 MailAPI。")
 
     # 加载代理池
     proxy_pool = load_proxy_pool()
@@ -846,9 +850,7 @@ def main():
     else:
         log.warning("⚠️ 代理池为空，将直连（可能被封）")
 
-    # 自动生成随机邮箱
-    batch = [MailAccount(email=random_email()) for _ in range(args.count)]
-    total = len(batch)
+    total = args.count
     log.info(f"🚀 本次注册: {total} 个 (并发: {args.workers})")
 
     stats = {"ok": 0, "fail": 0}
@@ -858,18 +860,18 @@ def main():
 
     if args.workers <= 1:
         # 串行模式
-        for i, acc in enumerate(batch, 1):
-            _do_one(acc, mail_api, i, total, proxy_pool, stats, lock)
+        for i in range(1, total + 1):
+            _do_one(i, total, proxy_pool, stats, lock)
     else:
         # 并行模式
         with ThreadPoolExecutor(max_workers=args.workers) as pool:
             futs = {}
-            for i, acc in enumerate(batch, 1):
+            for i in range(1, total + 1):
                 # 同一波次内错开启动
                 wave_pos = (i - 1) % args.workers
                 delay = wave_pos * random.uniform(1.0, 2.5) if wave_pos > 0 else 0
-                fut = pool.submit(_do_one, acc, mail_api, i, total, proxy_pool, stats, lock, delay)
-                futs[fut] = acc.email
+                fut = pool.submit(_do_one, i, total, proxy_pool, stats, lock, delay)
+                futs[fut] = i
 
             for fut in as_completed(futs):
                 try:

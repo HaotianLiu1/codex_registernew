@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+tokens/
+codex_register.log
+.env
